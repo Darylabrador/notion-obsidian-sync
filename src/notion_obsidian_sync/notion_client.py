@@ -6,6 +6,7 @@ mutates Notion content. Only the following read operations are implemented:
     GET  /v1/users/me
     GET  /v1/pages/{id}
     GET  /v1/pages/{id}/properties/{property_id}   (paginated property values)
+    GET  /v1/blocks/{id}
     GET  /v1/blocks/{id}/children                  (paginated)
     GET  /v1/databases/{id}
     GET  /v1/data_sources/{id}
@@ -158,6 +159,9 @@ class NotionClient:
             return self._get(f"/pages/{page_id}/properties/{property_id}", params=params)
 
         return self._paginate(fetch_page)
+
+    def get_block(self, block_id: str) -> dict[str, Any]:
+        return self._get(f"/blocks/{block_id}")
 
     def get_block_children(self, block_id: str) -> list[dict[str, Any]]:
         def fetch_page(cursor: str | None) -> dict[str, Any]:

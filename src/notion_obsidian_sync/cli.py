@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -11,14 +13,77 @@ from .config import Config, load_config
 from .logging_config import get_logger, setup_logging
 from .notion_client import NotionAPIError, NotionClient
 from .state import StateStore
-from .sync import SyncResult, run_sync
+from .sync import ProgressCallback, SyncResult, run_sync
 
 SUCCESS, FAILURE = 0, 1
 
+_PHASE_LABELS = {"resolve": "Resolving pages", "sync": "Syncing"}
 
-def _load_and_validate(verbose: bool) -> Config:
+
+class ProgressReporter:
+    """Renders a single self-overwriting progress line to stderr while a sync
+    runs — the discovery/decision phase (`resolve`) can take a while on a
+    large workspace since it's rate-limited by the Notion API, with nothing
+    else printed in the meantime otherwise. Silently disabled (no writes) if
+    stderr isn't a terminal, since a `\\r`-based line is meaningless once
+    redirected to a file/log.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled and sys.stderr.isatty()
+        self._phase_start: dict[str, float] = {}
+        self._last_len = 0
+
+    def callback(self) -> ProgressCallback:
+        def _update(phase: str, index: int, total: int) -> None:
+            if not self.enabled or total == 0:
+                return
+            now = time.monotonic()
+            start = self._phase_start.setdefault(phase, now)
+            elapsed = now - start
+            eta = (elapsed / index) * (total - index) if index else 0.0
+            pct = index / total
+            bar_width = 20
+            filled = int(bar_width * pct)
+            bar = "#" * filled + "-" * (bar_width - filled)
+            label = _PHASE_LABELS.get(phase, phase)
+            line = f"{label}: [{bar}] {index}/{total} ({pct:.0%}) ETA {_format_duration(eta)}"
+            width = shutil.get_terminal_size((80, 20)).columns - 1
+            line = line[:width]
+            pad = max(0, self._last_len - len(line))
+            sys.stderr.write("\r" + line + (" " * pad))
+            sys.stderr.flush()
+            self._last_len = len(line)
+
+        return _update
+
+    def clear_line(self) -> None:
+        """Blank out the current progress line so a log message can print
+        cleanly above it; the next `callback()` update redraws the bar.
+        """
+        if self.enabled and self._last_len:
+            sys.stderr.write("\r" + " " * self._last_len + "\r")
+            sys.stderr.flush()
+        self._last_len = 0
+
+    def finish(self) -> None:
+        self.clear_line()
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def _load_and_validate(verbose: bool, progress: ProgressReporter | None = None) -> Config:
     config = load_config()
-    setup_logging(level=config.log_level, log_dir=config.log_dir, verbose=verbose)
+    setup_logging(
+        level=config.log_level,
+        log_dir=config.log_dir,
+        verbose=verbose,
+        pre_emit_hook=progress.clear_line if progress and progress.enabled else None,
+    )
     problems = config.validate()
     if problems:
         click.echo("Configuration problems found:", err=True)
@@ -66,16 +131,25 @@ def main() -> None:
 @click.option("--dry-run", is_flag=True, help="Compute actions without writing anything.")
 def sync(full: bool, page_id: str | None, verbose: bool, dry_run: bool) -> None:
     """Run a synchronization pass."""
-    config = _load_and_validate(verbose)
+    progress = ProgressReporter(enabled=not verbose)
+    config = _load_and_validate(verbose, progress)
     client = _make_client(config)
     with StateStore(config.state_db_path) as state:
         try:
             result = run_sync(
-                config, client, state, dry_run=dry_run, single_page_id=page_id, force=full
+                config,
+                client,
+                state,
+                dry_run=dry_run,
+                single_page_id=page_id,
+                force=full,
+                on_progress=progress.callback(),
             )
         except NotionAPIError as exc:
             click.echo(f"Notion API error: {exc}", err=True)
             raise SystemExit(FAILURE) from exc
+        finally:
+            progress.finish()
     _print_summary(result)
     raise SystemExit(SUCCESS if result.ok else FAILURE)
 
@@ -84,14 +158,19 @@ def sync(full: bool, page_id: str | None, verbose: bool, dry_run: bool) -> None:
 @click.option("--verbose", is_flag=True, help="Enable debug-level logging.")
 def dry_run_cmd(verbose: bool) -> None:
     """Show what would change without writing or downloading anything."""
-    config = _load_and_validate(verbose)
+    progress = ProgressReporter(enabled=not verbose)
+    config = _load_and_validate(verbose, progress)
     client = _make_client(config)
     with StateStore(config.state_db_path) as state:
         try:
-            result = run_sync(config, client, state, dry_run=True)
+            result = run_sync(
+                config, client, state, dry_run=True, on_progress=progress.callback()
+            )
         except NotionAPIError as exc:
             click.echo(f"Notion API error: {exc}", err=True)
             raise SystemExit(FAILURE) from exc
+        finally:
+            progress.finish()
     _print_summary(result)
     raise SystemExit(SUCCESS if result.ok else FAILURE)
 

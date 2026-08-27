@@ -5,6 +5,7 @@ project spec, plus a rotating file log. The Notion token is never logged.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,8 +23,26 @@ class _ConsoleFormatter(logging.Formatter):
         return super().format(record)
 
 
+class _HookedStreamHandler(logging.StreamHandler):
+    """A StreamHandler that runs a hook right before each write — used to
+    clear an in-progress `\\r`-updating progress line so log output doesn't
+    get garbled onto the same terminal line.
+    """
+
+    def __init__(self, pre_emit_hook: Callable[[], None]) -> None:
+        super().__init__()
+        self._pre_emit_hook = pre_emit_hook
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._pre_emit_hook()
+        super().emit(record)
+
+
 def setup_logging(
-    level: str = "INFO", log_dir: Path | None = None, verbose: bool = False
+    level: str = "INFO",
+    log_dir: Path | None = None,
+    verbose: bool = False,
+    pre_emit_hook: Callable[[], None] | None = None,
 ) -> logging.Logger:
     logger = logging.getLogger(_LOGGER_NAME)
     logger.setLevel(logging.DEBUG if verbose else level.upper())
@@ -33,7 +52,7 @@ def setup_logging(
     fmt = "%(asctime)s %(levelname)-5s %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
-    console = logging.StreamHandler()
+    console = _HookedStreamHandler(pre_emit_hook) if pre_emit_hook else logging.StreamHandler()
     console.setFormatter(_ConsoleFormatter(fmt, datefmt=datefmt))
     logger.addHandler(console)
 

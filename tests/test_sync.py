@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from notion_obsidian_sync.config import Config
+from notion_obsidian_sync.links import normalize_id
 from notion_obsidian_sync.state import StateStore
-from notion_obsidian_sync.sync import run_sync
+from notion_obsidian_sync.sync import discover_workspace, fetch_block_tree, run_sync
 
 
 class FakeNotionClient:
@@ -22,6 +23,8 @@ class FakeNotionClient:
         data_sources: dict | None = None,
         rows: dict | None = None,
         data_source_objects: dict | None = None,
+        blocks: dict | None = None,
+        forbid_block_children: bool = False,
     ) -> None:
         self.pages = pages
         self.children = children
@@ -31,11 +34,24 @@ class FakeNotionClient:
         # data_source_id -> searchable data_source object ({id, title, ...}),
         # as returned by /v1/search with filter value "data_source".
         self.data_source_objects = data_source_objects or {}
+        self.blocks = blocks or {}  # block_id -> block dict (for GET /v1/blocks/{id})
+        # When True, get_block_children raises instead of returning results —
+        # used to assert a discovery path never walks the block tree.
+        self.forbid_block_children = forbid_block_children
+        self.block_children_calls: list[str] = []
 
     def get_page(self, page_id: str) -> dict:
         return self.pages[page_id]
 
+    def get_block(self, block_id: str) -> dict:
+        return self.blocks[block_id]
+
     def get_block_children(self, block_id: str) -> list[dict]:
+        self.block_children_calls.append(block_id)
+        if self.forbid_block_children:
+            raise AssertionError(
+                f"get_block_children({block_id!r}) should not have been called"
+            )
         return self.children.get(block_id, [])
 
     def get_database(self, database_id: str) -> dict:
@@ -356,6 +372,9 @@ def _make_workspace_config(tmp_path: Path, vault: Path) -> Config:
 def test_workspace_mode_covers_top_level_pages_and_databases(tmp_path, vault):
     # A top-level page (and its nested child) plus a database with one row,
     # both accessible to the integration but never explicitly configured.
+    # Under the 2025-09-03 API, a database row's parent is a data_source_id
+    # (not a database_id) — /v1/search(filter=page) returns it directly, no
+    # block-tree walk or query_data_source call needed to discover it.
     pages = {
         "p1": _page("p1", "Standalone", "2026-01-01T00:00:00.000Z", parent={"type": "workspace"}),
         "p2": _page(
@@ -364,18 +383,12 @@ def test_workspace_mode_covers_top_level_pages_and_databases(tmp_path, vault):
         ),
         "row1": _page(
             "row1", "Row One", "2026-01-01T00:00:00.000Z",
-            parent={"type": "database_id", "database_id": "db1"},
+            parent={"type": "data_source_id", "data_source_id": "ds1"},
         ),
     }
-    children = {"p1": [_child_page_block("p2", "Nested Child")], "p2": []}
-    databases = {"db1": _db("db1", "My Database")}
-    data_sources = {"db1": ["ds1"]}
-    rows = {"ds1": [pages["row1"]]}
     data_source_objects = {"ds1": _db("ds1", "My Database")}
 
-    client = FakeNotionClient(
-        pages, children, databases, data_sources, rows, data_source_objects
-    )
+    client = FakeNotionClient(pages, {}, data_source_objects=data_source_objects)
     config = _make_workspace_config(tmp_path, vault)
 
     with StateStore(config.state_db_path) as state:
@@ -406,23 +419,42 @@ def test_workspace_mode_places_page_with_inaccessible_parent_at_top(tmp_path, va
     assert (config.sync_root / "Orphan Page.md").exists()
 
 
+def test_workspace_mode_resolves_page_nested_inside_a_block(tmp_path, vault):
+    # A page whose parent is a block (e.g. nested inside a toggle/column on
+    # another page), not a page directly — needs one GET /v1/blocks/{id} hop.
+    pages = {
+        "p1": _page("p1", "Container", "2026-01-01T00:00:00.000Z", parent={"type": "workspace"}),
+        "nested": _page(
+            "nested", "Deep Page", "2026-01-01T00:00:00.000Z",
+            parent={"type": "block_id", "block_id": "toggle-block"},
+        ),
+    }
+    blocks = {
+        "toggle-block": {"id": "toggle-block", "parent": {"type": "page_id", "page_id": "p1"}}
+    }
+
+    client = FakeNotionClient(pages, {}, blocks=blocks)
+    config = _make_workspace_config(tmp_path, vault)
+
+    with StateStore(config.state_db_path) as state:
+        result = run_sync(config, client, state)
+
+    assert result.created == 2
+    assert (config.sync_root / "Container" / "Deep Page.md").exists()
+
+
 def test_workspace_mode_respects_sync_property_filter(tmp_path, vault):
     checked_row = _page("row-yes", "Include Me", "2026-01-01T00:00:00.000Z",
-                         parent={"type": "database_id", "database_id": "db1"})
+                         parent={"type": "data_source_id", "data_source_id": "ds1"})
     checked_row["properties"]["Sync Obsidian"] = {"type": "checkbox", "checkbox": True}
     unchecked_row = _page("row-no", "Exclude Me", "2026-01-01T00:00:00.000Z",
-                           parent={"type": "database_id", "database_id": "db1"})
+                           parent={"type": "data_source_id", "data_source_id": "ds1"})
     unchecked_row["properties"]["Sync Obsidian"] = {"type": "checkbox", "checkbox": False}
 
-    databases = {"db1": _db("db1", "Filtered DB")}
-    data_sources = {"db1": ["ds1"]}
-    rows = {"ds1": [checked_row, unchecked_row]}
     data_source_objects = {"ds1": _db("ds1", "Filtered DB")}
-    # A real /v1/search (filter: page) also returns database rows, since rows
-    # are pages too — this must not bypass the sync_property filter above.
     pages = {"row-yes": checked_row, "row-no": unchecked_row}
 
-    client = FakeNotionClient(pages, {}, databases, data_sources, rows, data_source_objects)
+    client = FakeNotionClient(pages, {}, data_source_objects=data_source_objects)
     config = Config(
         notion_token="fake-token",
         obsidian_vault_path=vault,
@@ -438,3 +470,67 @@ def test_workspace_mode_respects_sync_property_filter(tmp_path, vault):
     assert result.created == 1
     assert (config.sync_root / "Filtered DB" / "Include Me.md").exists()
     assert not (config.sync_root / "Filtered DB" / "Exclude Me.md").exists()
+
+
+def test_workspace_discovery_never_walks_the_block_tree():
+    # Regression guard: discover_workspace() must reconstruct the whole
+    # hierarchy from /v1/search results alone (parent pointers), never by
+    # calling get_block_children — on a real workspace with hundreds of
+    # deeply-nested pages, walking every block tree just to *find* pages
+    # made discovery itself take many minutes before any syncing even began.
+    pages = {
+        "p1": _page("p1", "Root", "2026-01-01T00:00:00.000Z", parent={"type": "workspace"}),
+        "p2": _page(
+            "p2", "Child", "2026-01-01T00:00:00.000Z",
+            parent={"type": "page_id", "page_id": "p1"},
+        ),
+        "row1": _page(
+            "row1", "Row", "2026-01-01T00:00:00.000Z",
+            parent={"type": "data_source_id", "data_source_id": "ds1"},
+        ),
+        "deep": _page(
+            "deep", "Deep", "2026-01-01T00:00:00.000Z",
+            parent={"type": "block_id", "block_id": "toggle-block"},
+        ),
+    }
+    blocks = {
+        "toggle-block": {"id": "toggle-block", "parent": {"type": "page_id", "page_id": "p2"}}
+    }
+    data_source_objects = {"ds1": _db("ds1", "My Database")}
+
+    client = FakeNotionClient(
+        pages,
+        {},
+        blocks=blocks,
+        data_source_objects=data_source_objects,
+        forbid_block_children=True,
+    )
+
+    discovered = discover_workspace(client, sync_property="")
+
+    by_id = {normalize_id(dp.notion_id): dp for dp in discovered}
+    assert set(by_id) == {"p1", "p2", "row1", "deep"}
+    assert by_id["p1"].folder_chain == ()
+    assert by_id["p2"].folder_chain == ("Root",)
+    assert by_id["row1"].folder_chain == ("My Database",)
+    assert by_id["deep"].folder_chain == ("Root", "Child")
+
+
+def test_fetch_block_tree_does_not_recurse_into_child_pages():
+    # Regression guard: a child_page block referenced from a parent page's
+    # content must not be recursively fetched — it's a separate Notion page,
+    # rendered and synced on its own. Recursing into it here meant rendering
+    # a single top-level page could silently re-fetch the entire nested
+    # subtree beneath it.
+    child_block = _child_page_block("child", "Child")
+    child_block["has_children"] = True
+    children = {
+        "parent": [child_block],
+        "child": [_paragraph_block("should never be fetched")],
+    }
+    client = FakeNotionClient({}, children)
+
+    tree = fetch_block_tree(client, "parent")
+
+    assert "child" not in client.block_children_calls
+    assert "_children" not in tree[0]

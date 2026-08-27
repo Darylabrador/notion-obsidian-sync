@@ -6,6 +6,7 @@ together; every write goes through `paths.py`'s sandboxing helpers.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,9 @@ from .utils import sha256_text
 logger = logging.getLogger("notion_obsidian_sync")
 
 MANAGED_BY = "notion-obsidian-sync"
+
+# phase ("resolve" | "sync"), current index (1-based), total
+ProgressCallback = Callable[[str, int, int], None]
 
 
 class SyncAbort(Exception):
@@ -71,13 +75,23 @@ class SyncResult:
 # -- block tree fetching ----------------------------------------------------------
 
 
+_NON_RECURSING_BLOCK_TYPES = {"child_page", "child_database"}
+
+
 def fetch_block_tree(client: NotionClient, block_id: str) -> list[dict[str, Any]]:
     """Recursively fetch a block's children (and their children, ...), attaching
     each block's children under `"_children"`.
+
+    `child_page` and `child_database` blocks are never recursed into: they
+    reference separate Notion objects that get discovered and rendered as
+    their own notes independently. Descending into them here would mean
+    rendering just one page silently re-fetches the entire nested subtree
+    beneath it — on a deep workspace that turns a single page's render into
+    a near-complete crawl of everything under it.
     """
     children = client.get_block_children(block_id)
     for block in children:
-        if block.get("has_children"):
+        if block.get("has_children") and block.get("type") not in _NON_RECURSING_BLOCK_TYPES:
             block["_children"] = fetch_block_tree(client, block["id"])
     return children
 
@@ -172,77 +186,100 @@ def discover_workspace(client: NotionClient, sync_property: str) -> list[Discove
 
     Notion's `/v1/search` returns every page/database that has been shared
     with the integration (directly, or via a shared ancestor), regardless of
-    nesting depth. To avoid double-processing and to keep folder placement
-    identical to Mode A/B, this:
-
-      1. Handles every accessible data source exactly like `discover_database`
-         (including `sync_property` filtering), which also walks each row's
-         nested child pages. (Search operates on `data_source` objects, not
-         `database` objects, per the 2025-09-03 data sources model.)
-      2. Starts a full tree walk (like `discover_root_tree`) from every
-         page whose parent is the workspace itself (a "true" top-level
-         page), which discovers all of its descendants structurally.
-      3. Anything still unaccounted for (reachable via search but whose
-         ancestor chain isn't fully accessible) is placed using whatever
-         ancestor titles we do have, so no accessible page is ever dropped.
+    nesting depth — this includes every *descendant* page too, not just
+    top-level ones. That means the whole hierarchy can be reconstructed
+    purely in memory from each page's `parent` pointer, without walking any
+    block tree (`get_block_children`) to "find" nested pages: doing so would
+    mean fetching a large fraction of the block structure of every page in
+    the workspace just to build the discovery list, before even knowing
+    which pages changed. On a workspace with hundreds of deeply-nested
+    pages that made discovery itself take many minutes; this makes it a
+    handful of paginated search calls total.
     """
-    out: list[DiscoveredPage] = []
-    seen: set[str] = set()
-
-    for ds in client.search(filter_={"property": "object", "value": "data_source"}):
-        ds_title = rich_text_plain(ds.get("title", [])) or "Database"
-        folder = (sanitize_filename(ds_title),)
-        _discover_data_source_rows(client, ds["id"], folder, sync_property, out, seen)
+    data_sources = client.search(filter_={"property": "object", "value": "data_source"})
+    ds_titles = {
+        normalize_id(ds["id"]): rich_text_plain(ds.get("title", [])) or "Database"
+        for ds in data_sources
+    }
 
     all_pages = client.search(filter_={"property": "object", "value": "page"})
     pages_by_id = {normalize_id(p["id"]): p for p in all_pages}
+    block_cache: dict[str, dict[str, Any]] = {}
 
+    out: list[DiscoveredPage] = []
     for page in all_pages:
-        page_id = normalize_id(page["id"])
-        if page_id in seen or page.get("parent", {}).get("type") != "workspace":
+        if page.get("archived") or page.get("in_trash"):
             continue
+        parent = page.get("parent", {})
+        if parent.get("type") in ("data_source_id", "database_id"):
+            properties = page.get("properties", {})
+            if sync_property and not _sync_property_enabled(properties, sync_property):
+                continue
         title = get_title(page.get("properties", {})) or "Untitled"
-        seen.add(page_id)
-        out.append(DiscoveredPage(page["id"], title, (), page_object=page))
-        _walk_child_pages(client, page["id"], (sanitize_filename(title),), out, seen)
-
-    for page in all_pages:
-        page_id = normalize_id(page["id"])
-        if page_id in seen:
-            continue
-        if page.get("parent", {}).get("type") == "database_id":
-            # A database row not covered by step 1 was deliberately excluded
-            # there (sync_property filter, archived, in_trash) — never
-            # re-include it here.
-            continue
-        title = get_title(page.get("properties", {})) or "Untitled"
-        chain = _resolve_chain_from_cache(page, pages_by_id)
-        if not chain:
-            logger.warning(
-                "'%s' is accessible but its parent page isn't; placing it at the top "
-                "of the sync folder.",
-                title,
-            )
-        seen.add(page_id)
+        chain = _resolve_workspace_chain(client, page, pages_by_id, ds_titles, block_cache)
         out.append(DiscoveredPage(page["id"], title, chain, page_object=page))
 
     return out
 
 
-def _resolve_chain_from_cache(
-    page: dict[str, Any], pages_by_id: dict[str, dict[str, Any]]
+def _resolve_workspace_chain(
+    client: NotionClient,
+    page: dict[str, Any],
+    pages_by_id: dict[str, dict[str, Any]],
+    ds_titles: dict[str, str],
+    block_cache: dict[str, dict[str, Any]],
 ) -> tuple[str, ...]:
+    """Walk `page`'s `parent` pointers up to the workspace root, using only
+    the already-fetched `pages_by_id`/`ds_titles` caches — the one exception
+    is a `block_id` parent (a page nested inside e.g. a toggle/column, not
+    directly inside another page), which needs one `GET /v1/blocks/{id}`
+    call per distinct block encountered (cached, and rare in practice).
+    """
     chain: list[str] = []
     parent = page.get("parent", {})
     guard = 0
-    while parent.get("type") == "page_id" and guard < 50:
+    while guard < 50:
         guard += 1
-        ancestor = pages_by_id.get(normalize_id(parent["page_id"]))
-        if ancestor is None:
-            break  # ancestor isn't accessible to the integration; stop here
-        ancestor_title = get_title(ancestor.get("properties", {})) or "Untitled"
-        chain.insert(0, sanitize_filename(ancestor_title))
-        parent = ancestor.get("parent", {})
+        ptype = parent.get("type")
+
+        if ptype == "page_id":
+            ancestor = pages_by_id.get(normalize_id(parent["page_id"]))
+            if ancestor is None:
+                logger.warning(
+                    "'%s' is accessible but one of its ancestor pages isn't; placing it "
+                    "using whatever ancestors could be resolved.",
+                    get_title(page.get("properties", {})) or "Untitled",
+                )
+                break
+            ancestor_title = get_title(ancestor.get("properties", {})) or "Untitled"
+            chain.insert(0, sanitize_filename(ancestor_title))
+            parent = ancestor.get("parent", {})
+            continue
+
+        if ptype == "data_source_id":
+            ds_id = normalize_id(parent["data_source_id"])
+            chain.insert(0, sanitize_filename(ds_titles.get(ds_id, "Database")))
+            break  # rows live in a flat folder, like Mode B — no deeper nesting
+
+        if ptype == "database_id":  # defensive: older API versions/shapes
+            ds_id = normalize_id(parent["database_id"])
+            chain.insert(0, sanitize_filename(ds_titles.get(ds_id, "Database")))
+            break
+
+        if ptype == "block_id":
+            block_id = normalize_id(parent["block_id"])
+            block = block_cache.get(block_id)
+            if block is None:
+                try:
+                    block = client.get_block(parent["block_id"])
+                except NotionAPIError:
+                    break
+                block_cache[block_id] = block
+            parent = block.get("parent", {})
+            continue
+
+        break  # "workspace", or anything unrecognized: stop here
+
     return tuple(chain)
 
 
@@ -252,16 +289,29 @@ def discover_single_page(client: NotionClient, page_id: str) -> DiscoveredPage:
     chain: list[str] = []
     parent = page.get("parent", {})
     guard = 0
-    while parent.get("type") == "page_id" and guard < 50:
+    while guard < 50:
         guard += 1
-        ancestor = client.get_page(parent["page_id"])
-        ancestor_title = get_title(ancestor.get("properties", {})) or "Untitled"
-        chain.insert(0, sanitize_filename(ancestor_title))
-        parent = ancestor.get("parent", {})
-    if parent.get("type") == "database_id":
-        db = client.get_database(parent["database_id"])
-        db_title = rich_text_plain(db.get("title", [])) or "Database"
-        chain.insert(0, sanitize_filename(db_title))
+        ptype = parent.get("type")
+        if ptype == "page_id":
+            ancestor = client.get_page(parent["page_id"])
+            ancestor_title = get_title(ancestor.get("properties", {})) or "Untitled"
+            chain.insert(0, sanitize_filename(ancestor_title))
+            parent = ancestor.get("parent", {})
+        elif ptype == "block_id":
+            block = client.get_block(parent["block_id"])
+            parent = block.get("parent", {})
+        elif ptype == "data_source_id":
+            ds = client.get_data_source(parent["data_source_id"])
+            ds_title = rich_text_plain(ds.get("title", [])) or "Database"
+            chain.insert(0, sanitize_filename(ds_title))
+            break  # rows live in a flat folder, like Mode B — no deeper nesting
+        elif ptype == "database_id":  # defensive: older API versions/shapes
+            db = client.get_database(parent["database_id"])
+            db_title = rich_text_plain(db.get("title", [])) or "Database"
+            chain.insert(0, sanitize_filename(db_title))
+            break
+        else:
+            break
     return DiscoveredPage(page_id, title, tuple(chain), page_object=page)
 
 
@@ -421,6 +471,7 @@ def run_sync(
     dry_run: bool = False,
     single_page_id: str | None = None,
     force: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> SyncResult:
     result = SyncResult(dry_run=dry_run)
     full_discovery = single_page_id is None
@@ -456,7 +507,10 @@ def run_sync(
     page_index = PageIndex()
 
     plans: list[tuple[DiscoveredPage, str, str]] = []  # (page, action, target_path)
-    for dp in discovered:
+    total_discovered = len(discovered)
+    for idx, dp in enumerate(discovered, start=1):
+        if on_progress:
+            on_progress("resolve", idx, total_discovered)
         existing = state.get(normalize_id(dp.notion_id))
 
         # A `child_page` block's own last_edited_time is not a reliable proxy for
@@ -492,7 +546,10 @@ def run_sync(
         page_index.register(dp.notion_id, f"{config.obsidian_sync_folder}/{without_ext}")
         plans.append((dp, action, target_path))
 
-    for dp, action, target_path in plans:
+    total_plans = len(plans)
+    for idx, (dp, action, target_path) in enumerate(plans, start=1):
+        if on_progress:
+            on_progress("sync", idx, total_plans)
         try:
             if action == "SKIP":
                 result.skipped += 1
