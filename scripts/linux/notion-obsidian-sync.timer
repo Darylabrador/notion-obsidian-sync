@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Notion -> Obsidian sync every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=notion-obsidian-sync.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Notion -> Obsidian sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# This path is substituted automatically by scripts/linux/install-systemd.sh.
+# If installing manually, replace __PROJECT_DIR__ with the absolute path to
+# the notion-obsidian-sync project directory.
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__PROJECT_DIR__/.venv/bin/notion-obsidian-sync sync
