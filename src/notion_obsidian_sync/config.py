@@ -34,7 +34,8 @@ class Config:
 
     notion_root_page_id: str | None = None
     notion_database_ids: list[str] = field(default_factory=list)
-    notion_sync_property: str = "Sync Obsidian"
+    notion_sync_property: str = ""
+    notion_sync_workspace: bool = False
 
     orphan_policy: str = "keep"
 
@@ -74,7 +75,9 @@ class Config:
         return self.project_dir / "logs"
 
     def has_selection(self) -> bool:
-        return bool(self.notion_root_page_id or self.notion_database_ids)
+        return bool(
+            self.notion_root_page_id or self.notion_database_ids or self.notion_sync_workspace
+        )
 
     def validate(self) -> list[str]:
         """Return a list of human-readable problems, empty if config is usable."""
@@ -96,7 +99,8 @@ class Config:
             )
         if not self.has_selection():
             problems.append(
-                "Set at least one of NOTION_ROOT_PAGE_ID or NOTION_DATABASE_IDS."
+                "Set at least one of NOTION_ROOT_PAGE_ID, NOTION_DATABASE_IDS, "
+                "or NOTION_SYNC_WORKSPACE=true."
             )
         return problems
 
@@ -120,7 +124,8 @@ def load_config(env_path: Path | None = None, project_dir: Path | None = None) -
         obsidian_sync_folder=os.environ.get("OBSIDIAN_SYNC_FOLDER", "Notion").strip() or "Notion",
         notion_root_page_id=os.environ.get("NOTION_ROOT_PAGE_ID", "").strip() or None,
         notion_database_ids=_split_ids(os.environ.get("NOTION_DATABASE_IDS", "")),
-        notion_sync_property=os.environ.get("NOTION_SYNC_PROPERTY", "Sync Obsidian").strip(),
+        notion_sync_property=os.environ.get("NOTION_SYNC_PROPERTY", "").strip(),
+        notion_sync_workspace=_bool(os.environ.get("NOTION_SYNC_WORKSPACE", ""), False),
         orphan_policy=os.environ.get("ORPHAN_POLICY", "keep").strip().lower() or "keep",
         download_assets=_bool(os.environ.get("DOWNLOAD_ASSETS", ""), True),
         convert_notion_links=_bool(os.environ.get("CONVERT_NOTION_LINKS", ""), True),

@@ -129,21 +129,32 @@ def discover_database(
     seen: set[str] = set()
 
     for data_source_id in client.resolve_data_source_ids(database_id):
-        for row in client.query_data_source(data_source_id):
-            if row.get("archived") or row.get("in_trash"):
-                continue
-            properties = row.get("properties", {})
-            if sync_property and not _sync_property_enabled(properties, sync_property):
-                continue
-            title = get_title(properties) or "Untitled"
-            page_id = normalize_id(row["id"])
-            if page_id in seen:
-                continue
-            seen.add(page_id)
-            out.append(DiscoveredPage(row["id"], title, db_folder, page_object=row))
-            _walk_child_pages(client, row["id"], (*db_folder, sanitize_filename(title)), out, seen)
+        _discover_data_source_rows(client, data_source_id, db_folder, sync_property, out, seen)
 
     return out
+
+
+def _discover_data_source_rows(
+    client: NotionClient,
+    data_source_id: str,
+    folder: tuple[str, ...],
+    sync_property: str,
+    out: list[DiscoveredPage],
+    seen: set[str],
+) -> None:
+    for row in client.query_data_source(data_source_id):
+        if row.get("archived") or row.get("in_trash"):
+            continue
+        properties = row.get("properties", {})
+        if sync_property and not _sync_property_enabled(properties, sync_property):
+            continue
+        title = get_title(properties) or "Untitled"
+        page_id = normalize_id(row["id"])
+        if page_id in seen:
+            continue
+        seen.add(page_id)
+        out.append(DiscoveredPage(row["id"], title, folder, page_object=row))
+        _walk_child_pages(client, row["id"], (*folder, sanitize_filename(title)), out, seen)
 
 
 def _sync_property_enabled(properties: dict[str, Any], property_name: str) -> bool:
@@ -153,6 +164,86 @@ def _sync_property_enabled(properties: dict[str, Any], property_name: str) -> bo
     if prop.get("type") == "checkbox":
         return bool(prop.get("checkbox"))
     return True
+
+
+def discover_workspace(client: NotionClient, sync_property: str) -> list[DiscoveredPage]:
+    """Discover every page and database the integration currently has access
+    to, workspace-wide, without requiring a specific root page or database ID.
+
+    Notion's `/v1/search` returns every page/database that has been shared
+    with the integration (directly, or via a shared ancestor), regardless of
+    nesting depth. To avoid double-processing and to keep folder placement
+    identical to Mode A/B, this:
+
+      1. Handles every accessible data source exactly like `discover_database`
+         (including `sync_property` filtering), which also walks each row's
+         nested child pages. (Search operates on `data_source` objects, not
+         `database` objects, per the 2025-09-03 data sources model.)
+      2. Starts a full tree walk (like `discover_root_tree`) from every
+         page whose parent is the workspace itself (a "true" top-level
+         page), which discovers all of its descendants structurally.
+      3. Anything still unaccounted for (reachable via search but whose
+         ancestor chain isn't fully accessible) is placed using whatever
+         ancestor titles we do have, so no accessible page is ever dropped.
+    """
+    out: list[DiscoveredPage] = []
+    seen: set[str] = set()
+
+    for ds in client.search(filter_={"property": "object", "value": "data_source"}):
+        ds_title = rich_text_plain(ds.get("title", [])) or "Database"
+        folder = (sanitize_filename(ds_title),)
+        _discover_data_source_rows(client, ds["id"], folder, sync_property, out, seen)
+
+    all_pages = client.search(filter_={"property": "object", "value": "page"})
+    pages_by_id = {normalize_id(p["id"]): p for p in all_pages}
+
+    for page in all_pages:
+        page_id = normalize_id(page["id"])
+        if page_id in seen or page.get("parent", {}).get("type") != "workspace":
+            continue
+        title = get_title(page.get("properties", {})) or "Untitled"
+        seen.add(page_id)
+        out.append(DiscoveredPage(page["id"], title, (), page_object=page))
+        _walk_child_pages(client, page["id"], (sanitize_filename(title),), out, seen)
+
+    for page in all_pages:
+        page_id = normalize_id(page["id"])
+        if page_id in seen:
+            continue
+        if page.get("parent", {}).get("type") == "database_id":
+            # A database row not covered by step 1 was deliberately excluded
+            # there (sync_property filter, archived, in_trash) — never
+            # re-include it here.
+            continue
+        title = get_title(page.get("properties", {})) or "Untitled"
+        chain = _resolve_chain_from_cache(page, pages_by_id)
+        if not chain:
+            logger.warning(
+                "'%s' is accessible but its parent page isn't; placing it at the top "
+                "of the sync folder.",
+                title,
+            )
+        seen.add(page_id)
+        out.append(DiscoveredPage(page["id"], title, chain, page_object=page))
+
+    return out
+
+
+def _resolve_chain_from_cache(
+    page: dict[str, Any], pages_by_id: dict[str, dict[str, Any]]
+) -> tuple[str, ...]:
+    chain: list[str] = []
+    parent = page.get("parent", {})
+    guard = 0
+    while parent.get("type") == "page_id" and guard < 50:
+        guard += 1
+        ancestor = pages_by_id.get(normalize_id(parent["page_id"]))
+        if ancestor is None:
+            break  # ancestor isn't accessible to the integration; stop here
+        ancestor_title = get_title(ancestor.get("properties", {})) or "Untitled"
+        chain.insert(0, sanitize_filename(ancestor_title))
+        parent = ancestor.get("parent", {})
+    return tuple(chain)
 
 
 def discover_single_page(client: NotionClient, page_id: str) -> DiscoveredPage:
@@ -334,6 +425,13 @@ def run_sync(
     result = SyncResult(dry_run=dry_run)
     full_discovery = single_page_id is None
 
+    logger.info(
+        "Starting %s (%s) -> %s",
+        "dry run" if dry_run else "sync",
+        _describe_selection(config, single_page_id),
+        config.sync_root,
+    )
+
     if state.count() == 0 and not dry_run:
         recovered = rehydrate_state(config, state)
         if recovered:
@@ -343,6 +441,14 @@ def run_sync(
 
     discovered = _discover_all(client, config, single_page_id)
     result.pages_seen = [normalize_id(p.notion_id) for p in discovered]
+
+    logger.info("Found %d page(s) matching your configuration.", len(discovered))
+    if not discovered:
+        logger.warning(
+            "No pages found. Run `notion-obsidian-sync doctor` to check how much content "
+            "the integration can actually see (Content Access tab in Notion) — a 0-page "
+            "result almost always means nothing has been shared with it yet."
+        )
 
     taken_paths: dict[str, str] = {
         r.file_path: normalize_id(r.notion_id) for r in state.all_records()
@@ -412,6 +518,19 @@ def run_sync(
     return result
 
 
+def _describe_selection(config: Config, single_page_id: str | None) -> str:
+    if single_page_id:
+        return f"page {single_page_id}"
+    parts = []
+    if config.notion_root_page_id:
+        parts.append(f"root page {config.notion_root_page_id}")
+    if config.notion_database_ids:
+        parts.append(f"{len(config.notion_database_ids)} database(s)")
+    if config.notion_sync_workspace:
+        parts.append("whole workspace")
+    return " + ".join(parts) if parts else "nothing configured"
+
+
 def _discover_all(
     client: NotionClient, config: Config, single_page_id: str | None
 ) -> list[DiscoveredPage]:
@@ -422,16 +541,30 @@ def _discover_all(
     seen: set[str] = set()
 
     if config.notion_root_page_id:
+        before = len(out)
         for dp in discover_root_tree(client, config.notion_root_page_id):
             if normalize_id(dp.notion_id) not in seen:
                 seen.add(normalize_id(dp.notion_id))
                 out.append(dp)
+        logger.info(
+            "Root page %s: found %d page(s).", config.notion_root_page_id, len(out) - before
+        )
 
     for database_id in config.notion_database_ids:
+        before = len(out)
         for dp in discover_database(client, database_id, config.notion_sync_property):
             if normalize_id(dp.notion_id) not in seen:
                 seen.add(normalize_id(dp.notion_id))
                 out.append(dp)
+        logger.info("Database %s: found %d page(s).", database_id, len(out) - before)
+
+    if config.notion_sync_workspace:
+        before = len(out)
+        for dp in discover_workspace(client, config.notion_sync_property):
+            if normalize_id(dp.notion_id) not in seen:
+                seen.add(normalize_id(dp.notion_id))
+                out.append(dp)
+        logger.info("Workspace-wide search: found %d page(s).", len(out) - before)
 
     return out
 

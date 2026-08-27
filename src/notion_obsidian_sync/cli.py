@@ -153,6 +153,32 @@ def doctor() -> None:
         except Exception as exc:  # noqa: BLE001
             click.echo(f"Notion token: [FAIL] could not reach Notion API: {exc}")
             ok = False
+        else:
+            try:
+                pages = client.search(filter_={"property": "object", "value": "page"})
+                data_sources = client.search(
+                    filter_={"property": "object", "value": "data_source"}
+                )
+                click.echo(
+                    f"Accessible content: {len(pages)} page(s), "
+                    f"{len(data_sources)} data source(s)"
+                )
+                if not pages and not data_sources:
+                    click.echo(
+                        "  [WARN] Nothing is shared with this integration yet — sync will "
+                        "find nothing to do."
+                    )
+                    click.echo(
+                        "         In Notion, open a page or database → \"...\" menu → "
+                        "Connections → add your integration."
+                    )
+                    click.echo(
+                        "         (Or, as a workspace owner: integration settings → "
+                        "Access tab → connect it to the whole workspace.)"
+                    )
+            except NotionAPIError as exc:
+                click.echo(f"Accessible content: [FAIL] {exc}")
+                ok = False
     else:
         click.echo("Notion token: [SKIPPED] (not configured)")
         ok = False

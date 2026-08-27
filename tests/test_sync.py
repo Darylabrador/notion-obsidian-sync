@@ -14,9 +14,23 @@ from notion_obsidian_sync.sync import run_sync
 class FakeNotionClient:
     """Duck-typed stand-in for NotionClient covering only what sync.py calls."""
 
-    def __init__(self, pages: dict, children: dict) -> None:
+    def __init__(
+        self,
+        pages: dict,
+        children: dict,
+        databases: dict | None = None,
+        data_sources: dict | None = None,
+        rows: dict | None = None,
+        data_source_objects: dict | None = None,
+    ) -> None:
         self.pages = pages
         self.children = children
+        self.databases = databases or {}
+        self.data_sources = data_sources or {}  # database_id -> [data_source_id, ...]
+        self.rows = rows or {}  # data_source_id -> [row page dict, ...]
+        # data_source_id -> searchable data_source object ({id, title, ...}),
+        # as returned by /v1/search with filter value "data_source".
+        self.data_source_objects = data_source_objects or {}
 
     def get_page(self, page_id: str) -> dict:
         return self.pages[page_id]
@@ -24,16 +38,22 @@ class FakeNotionClient:
     def get_block_children(self, block_id: str) -> list[dict]:
         return self.children.get(block_id, [])
 
-    def get_database(self, database_id: str) -> dict:  # pragma: no cover - unused here
-        raise NotImplementedError
+    def get_database(self, database_id: str) -> dict:
+        return self.databases[database_id]
 
-    def resolve_data_source_ids(self, database_id: str) -> list[str]:  # pragma: no cover
-        raise NotImplementedError
+    def resolve_data_source_ids(self, database_id: str) -> list[str]:
+        return self.data_sources.get(database_id, [])
 
-    def query_data_source(  # pragma: no cover - unused here
-        self, data_source_id: str, filter_=None
-    ) -> list[dict]:
-        raise NotImplementedError
+    def query_data_source(self, data_source_id: str, filter_=None) -> list[dict]:
+        return self.rows.get(data_source_id, [])
+
+    def search(self, query: str = "", filter_: dict | None = None) -> list[dict]:
+        value = (filter_ or {}).get("value")
+        if value == "data_source":
+            return list(self.data_source_objects.values())
+        if value == "page":
+            return list(self.pages.values())
+        return [*self.pages.values(), *self.data_source_objects.values()]
 
 
 def _title_prop(text: str) -> dict:
@@ -317,3 +337,104 @@ def test_reset_state_recovers_existing_managed_files(tmp_path, vault):
 
     assert list((config.sync_root / "Root").glob("*.md"))  # no duplicate files created
     assert not list(config.sync_root.glob("Root (*.md"))
+
+
+def _db(db_id: str, title: str) -> dict:
+    return {"id": db_id, "title": [{"type": "text", "plain_text": title}]}
+
+
+def _make_workspace_config(tmp_path: Path, vault: Path) -> Config:
+    return Config(
+        notion_token="fake-token",
+        obsidian_vault_path=vault,
+        obsidian_sync_folder="Notion",
+        notion_sync_workspace=True,
+        project_dir=tmp_path,
+    )
+
+
+def test_workspace_mode_covers_top_level_pages_and_databases(tmp_path, vault):
+    # A top-level page (and its nested child) plus a database with one row,
+    # both accessible to the integration but never explicitly configured.
+    pages = {
+        "p1": _page("p1", "Standalone", "2026-01-01T00:00:00.000Z", parent={"type": "workspace"}),
+        "p2": _page(
+            "p2", "Nested Child", "2026-01-01T00:00:00.000Z",
+            parent={"type": "page_id", "page_id": "p1"},
+        ),
+        "row1": _page(
+            "row1", "Row One", "2026-01-01T00:00:00.000Z",
+            parent={"type": "database_id", "database_id": "db1"},
+        ),
+    }
+    children = {"p1": [_child_page_block("p2", "Nested Child")], "p2": []}
+    databases = {"db1": _db("db1", "My Database")}
+    data_sources = {"db1": ["ds1"]}
+    rows = {"ds1": [pages["row1"]]}
+    data_source_objects = {"ds1": _db("ds1", "My Database")}
+
+    client = FakeNotionClient(
+        pages, children, databases, data_sources, rows, data_source_objects
+    )
+    config = _make_workspace_config(tmp_path, vault)
+
+    with StateStore(config.state_db_path) as state:
+        result = run_sync(config, client, state)
+
+    assert result.created == 3
+    assert (config.sync_root / "Standalone.md").exists()
+    assert (config.sync_root / "Standalone" / "Nested Child.md").exists()
+    assert (config.sync_root / "My Database" / "Row One.md").exists()
+
+
+def test_workspace_mode_places_page_with_inaccessible_parent_at_top(tmp_path, vault):
+    # "orphan" is accessible but its parent "missing-parent" was never shared
+    # with the integration, so it never shows up in search results either.
+    pages = {
+        "orphan": _page(
+            "orphan", "Orphan Page", "2026-01-01T00:00:00.000Z",
+            parent={"type": "page_id", "page_id": "missing-parent"},
+        ),
+    }
+    client = FakeNotionClient(pages, {})
+    config = _make_workspace_config(tmp_path, vault)
+
+    with StateStore(config.state_db_path) as state:
+        result = run_sync(config, client, state)
+
+    assert result.created == 1
+    assert (config.sync_root / "Orphan Page.md").exists()
+
+
+def test_workspace_mode_respects_sync_property_filter(tmp_path, vault):
+    checked_row = _page("row-yes", "Include Me", "2026-01-01T00:00:00.000Z",
+                         parent={"type": "database_id", "database_id": "db1"})
+    checked_row["properties"]["Sync Obsidian"] = {"type": "checkbox", "checkbox": True}
+    unchecked_row = _page("row-no", "Exclude Me", "2026-01-01T00:00:00.000Z",
+                           parent={"type": "database_id", "database_id": "db1"})
+    unchecked_row["properties"]["Sync Obsidian"] = {"type": "checkbox", "checkbox": False}
+
+    databases = {"db1": _db("db1", "Filtered DB")}
+    data_sources = {"db1": ["ds1"]}
+    rows = {"ds1": [checked_row, unchecked_row]}
+    data_source_objects = {"ds1": _db("ds1", "Filtered DB")}
+    # A real /v1/search (filter: page) also returns database rows, since rows
+    # are pages too — this must not bypass the sync_property filter above.
+    pages = {"row-yes": checked_row, "row-no": unchecked_row}
+
+    client = FakeNotionClient(pages, {}, databases, data_sources, rows, data_source_objects)
+    config = Config(
+        notion_token="fake-token",
+        obsidian_vault_path=vault,
+        obsidian_sync_folder="Notion",
+        notion_sync_workspace=True,
+        notion_sync_property="Sync Obsidian",
+        project_dir=tmp_path,
+    )
+
+    with StateStore(config.state_db_path) as state:
+        result = run_sync(config, client, state)
+
+    assert result.created == 1
+    assert (config.sync_root / "Filtered DB" / "Include Me.md").exists()
+    assert not (config.sync_root / "Filtered DB" / "Exclude Me.md").exists()

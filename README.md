@@ -38,19 +38,51 @@ tool never calls a Notion write endpoint (see [Security](#10-security)).
 
 ## 1. Set up the Notion integration
 
-1. Go to <https://www.notion.so/my-integrations> and click **New integration**.
-2. Give it a name (e.g. "Obsidian Sync"), pick your workspace.
-3. Under **Capabilities**, enable only **Read content**. Leave **Update
-   content**, **Insert content**, and **No user information** as-is — this
-   tool never needs write access.
-4. Copy the generated **Internal Integration Secret** — this is your
-   `NOTION_TOKEN`.
-5. In Notion, open the page (or database) you want to sync, click the `...`
-   menu → **Connections** → add your integration. Everything nested under a
-   shared page is automatically accessible to the integration.
-6. To find a page or database ID: open it in the browser, and copy the
-   32-character ID from the URL, e.g.
-   `https://www.notion.so/My-Page-<page_id>`.
+1. Go to <https://app.notion.com/developers/connections> and click **New
+   connection** (this is the same thing referred to elsewhere as an
+   "integration" — <https://www.notion.so/my-integrations> redirects here
+   too).
+2. Give it a name (e.g. "Obsidian Sync") and pick the workspace to connect
+   it to.
+3. Under **Capabilities**, enable **only** the read permission — **Read
+   content** (and, if you want author/page-owner names in your frontmatter,
+   optionally **Read user information without email**). Leave every write
+   capability (**Update content**, **Insert content**, **Delete content**, ...)
+   **unchecked** — this tool never needs write access, and leaving those off
+   means it *cannot* modify Notion even if something in the pipeline goes
+   wrong.
+4. Save, then copy the generated **Internal Integration Secret** (starts
+   with `ntn_` or `secret_`) — this is your `NOTION_TOKEN`.
+5. Still on that connection's page, open the **Content Access** (previously
+   "Access") tab and add what it may read:
+   - Click **Add pages/databases**, search for and select the specific
+     page(s) and/or database(s) you want synced. Everything nested under a
+     selected page is automatically included too — no need to add its
+     children individually.
+   - Alternatively, as a workspace owner, some workspaces let you connect
+     the integration to the **entire workspace** from this same tab — the
+     simplest option if you're using `NOTION_SYNC_WORKSPACE=true` (see
+     below) and don't want to hand-pick pages.
+   - You can also grant access from inside a page itself: open it, click the
+     `...` menu → **Connections** → add your integration — equivalent to
+     adding it from the Content Access tab.
+6. To find a page or database ID for `NOTION_ROOT_PAGE_ID` /
+   `NOTION_DATABASE_IDS`: open it in the browser, and copy the 32-character
+   ID from the URL, e.g. `https://www.notion.so/My-Page-<page_id>`. Not
+   needed if you're using `NOTION_SYNC_WORKSPACE=true`.
+
+Run `notion-obsidian-sync doctor` at any point after this — besides
+checking your token, it reports exactly how many pages/data sources the
+integration can currently see, which is the fastest way to confirm step 5
+actually worked:
+
+```
+Notion token: [OK] authenticated as 'Obsidian Sync'
+Accessible content: 12 page(s), 2 data source(s)
+```
+
+If it instead reports `0 page(s), 0 data source(s)`, nothing has been
+granted to the integration yet — go back to step 5.
 
 ## 2. Install — Linux
 
@@ -101,9 +133,10 @@ All configuration lives in `.env` (copy from `.env.example`). Never commit
 | `NOTION_TOKEN` | yes | Internal integration secret, read-only capability. |
 | `OBSIDIAN_VAULT_PATH` | yes | Absolute path to your Obsidian vault. Windows: `C:\Users\John\Documents\Obsidian\MyVault`. |
 | `OBSIDIAN_SYNC_FOLDER` | no (default `Notion`) | Subfolder inside the vault. **All writes/deletions are sandboxed to this folder.** |
-| `NOTION_ROOT_PAGE_ID` | one of this or below | Mode A: sync this page and all descendant pages. |
-| `NOTION_DATABASE_IDS` | one of this or above | Mode B: comma-separated database IDs to sync (rows become notes). |
-| `NOTION_SYNC_PROPERTY` | no | Mode C: name of a checkbox property; only checked rows sync. Applies to `NOTION_DATABASE_IDS` only. Leave empty to sync every row. |
+| `NOTION_ROOT_PAGE_ID` | one of these four | Mode A: sync this page and all descendant pages. |
+| `NOTION_DATABASE_IDS` | one of these four | Mode B: comma-separated database IDs to sync (rows become notes). |
+| `NOTION_SYNC_WORKSPACE` | one of these four (default `false`) | Mode D: sync every page/database the integration currently has access to — no ID needed. Can be combined with the two above (harmless overlap, everything is deduplicated). |
+| `NOTION_SYNC_PROPERTY` | no (default empty = sync everything) | Mode C: name of a checkbox property; only checked rows sync. Applies to `NOTION_DATABASE_IDS` and `NOTION_SYNC_WORKSPACE`. |
 | `ORPHAN_POLICY` | no (default `keep`) | `keep` \| `archive` \| `delete`. What to do with a note whose Notion page disappeared. |
 | `DOWNLOAD_ASSETS` | no (default `true`) | Download images/files referenced in pages. |
 | `CONVERT_NOTION_LINKS` | no (default `true`) | Rewrite links between synced Notion pages as `[[wikilinks]]`. |
@@ -193,6 +226,25 @@ Notion/
     └── Project Beta.md
 ```
 
+**Mode D (whole workspace):** every accessible database is placed exactly
+like Mode B, and every accessible top-level page (and its descendants) is
+placed exactly like Mode A — so a workspace sync typically produces several
+top-level folders/notes side by side, one per shared page or database:
+
+```
+Notion/
+├── Standalone Page.md
+├── Meeting Notes/
+│   └── ...
+└── Projects/
+    ├── Project Alpha.md
+    └── Project Beta.md
+```
+
+If a page is accessible but its parent page isn't (an unusual sharing
+setup), it's still synced — placed directly at the top of `Notion/` with a
+`WARN` logged, rather than silently dropped.
+
 Filenames are sanitized for cross-platform safety (invalid Windows
 characters removed, reserved device names like `CON`/`PRN` prefixed with
 `_`, trailing dots/spaces stripped, Unicode/accents preserved). If two pages
@@ -250,7 +302,8 @@ against Notion once.
 | Symptom | Likely cause / fix |
 |---|---|
 | `Notion token: [FAIL] ... 401` | Token is wrong or was regenerated. Update `NOTION_TOKEN`. |
-| A page never shows up | The integration hasn't been shared with that page (or its parent). Open the page → `...` → Connections → add the integration. |
+| `doctor` reports `Accessible content: 0 page(s), 0 data source(s)` | Nothing has been granted to the integration yet. Go to <https://app.notion.com/developers/connections> → your connection → **Content Access** tab → add the pages/databases (or the whole workspace). See [1. Set up the Notion integration](#1-set-up-the-notion-integration). |
+| A page never shows up (but others do) | The integration hasn't been granted that specific page (or its parent). Add it via the **Content Access** tab, or open the page → `...` → **Connections** → add the integration. |
 | `object_not_found` for a database | Same as above, or you used a page ID instead of a database ID. |
 | `Obsidian vault: [FAIL] not found` | Check `OBSIDIAN_VAULT_PATH`; on Windows use a raw path like `C:\Users\...` (no need to escape backslashes in `.env`). |
 | `Sync folder writable: [FAIL]` | Fix permissions on the vault folder, or check it isn't on a read-only/synced-and-locked mount (e.g. mid-sync in a cloud storage client). |
