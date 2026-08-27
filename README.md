@@ -16,10 +16,11 @@ service (no Zapier/Make/n8n Cloud).
 - [6. Automation](#6-automation)
 - [7. How content is organized](#7-how-content-is-organized)
 - [8. Conflict and safety model](#8-conflict-and-safety-model)
-- [9. Troubleshooting](#9-troubleshooting)
-- [10. Uninstalling](#10-uninstalling)
-- [11. Security](#11-security)
-- [12. Development](#12-development)
+- [9. Encrypting the vault with git-crypt (optional)](#9-encrypting-the-vault-with-git-crypt-optional)
+- [10. Troubleshooting](#10-troubleshooting)
+- [11. Uninstalling](#11-uninstalling)
+- [12. Security](#12-security)
+- [13. Development](#13-development)
 
 ## How it works
 
@@ -34,7 +35,7 @@ service (no Zapier/Make/n8n Cloud).
    between synced Notion pages become `[[wikilinks]]`.
 
 All writes are sandboxed to `OBSIDIAN_VAULT_PATH/OBSIDIAN_SYNC_FOLDER`. The
-tool never calls a Notion write endpoint (see [Security](#10-security)).
+tool never calls a Notion write endpoint (see [Security](#12-security)).
 
 ## 1. Set up the Notion integration
 
@@ -102,7 +103,7 @@ notion-obsidian-sync dry-run
 notion-obsidian-sync sync
 ```
 
-To remove it later, see [10. Uninstalling](#10-uninstalling).
+To remove it later, see [11. Uninstalling](#11-uninstalling).
 
 ## 3. Install — Windows
 
@@ -121,7 +122,7 @@ Edit `.env`, then:
 .\.venv\Scripts\notion-obsidian-sync.exe sync
 ```
 
-To remove it later, see [10. Uninstalling](#10-uninstalling).
+To remove it later, see [11. Uninstalling](#11-uninstalling).
 
 ## 4. Configuration
 
@@ -158,6 +159,7 @@ notion-obsidian-sync dry-run           # show what would change; writes nothing
 notion-obsidian-sync status            # summarize local state
 notion-obsidian-sync doctor            # check Python, .env, Notion access, vault permissions
 notion-obsidian-sync reset-state       # forget local sync state (does not delete notes)
+notion-obsidian-sync git-crypt-setup   # encrypt the sync folder at rest with git-crypt (optional)
 ```
 
 Exit code is `0` if every page synced without error, `1` otherwise — a single
@@ -297,7 +299,53 @@ scans existing notes for the `managed_by`/`notion_id` markers and re-adopts
 them instead of creating duplicates — it just re-verifies their content
 against Notion once.
 
-## 9. Troubleshooting
+## 9. Encrypting the vault with git-crypt (optional)
+
+Synced Notion content can be sensitive, so if you want to version-control
+the sync folder (e.g. to push it to a private or even public git remote as
+a backup), `notion-obsidian-sync git-crypt-setup` sets up
+[git-crypt](https://github.com/AGWA/git-crypt) so it's encrypted at rest in
+git — your local working copy stays readable Markdown; only what git stores
+(history, and anything pushed to a remote) is encrypted.
+
+Install `git-crypt` first (`sudo apt install git-crypt`, `brew install
+git-crypt`), then:
+
+```bash
+notion-obsidian-sync git-crypt-setup
+```
+
+By default this targets the configured sync folder
+(`OBSIDIAN_VAULT_PATH/OBSIDIAN_SYNC_FOLDER`). It initializes a git
+repository if needed, writes a `.gitattributes` that encrypts every file,
+and runs `git-crypt init`. It's safe to re-run — steps already done are
+left as-is.
+
+To actually be able to unlock the repository again later (on another
+machine, or if you lose the auto-generated key), pass at least one of:
+
+```bash
+# Grant specific people/machines access via their GPG key:
+notion-obsidian-sync git-crypt-setup --gpg-user you@example.com
+
+# Or export a symmetric key file — back it up somewhere safe, outside git:
+notion-obsidian-sync git-crypt-setup --export-key ~/secure/vault.key
+
+# Set up a different directory than the configured sync folder:
+notion-obsidian-sync git-crypt-setup --path /path/to/some/repo
+```
+
+The command prints the exact next steps (`git add .gitattributes && git
+commit ...`) — it never creates a commit on your behalf, except
+`git-crypt add-gpg-user`'s own inherent commit of the newly-wrapped key,
+which is git-crypt's own behavior, not something added on top.
+
+To unlock a clone elsewhere: `git-crypt unlock /path/to/vault.key`
+(symmetric key) — or nothing at all if you're a GPG user who was granted
+access and have the matching private key, since `git clone` + normal Git
+operations will auto-decrypt for you.
+
+## 10. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -312,7 +360,7 @@ against Notion once.
 | An image shows a broken link | The asset download failed (network/timeout) — check the log for a `WARN`; it will retry on the next `sync` since the page will still show as changed if you edit it again, or run `sync --full` to force re-fetch. |
 | `WARN Refusing to overwrite unmanaged file` | A file already exists at that path without our frontmatter marker. Move it aside manually if you want that Notion page synced there. |
 
-## 10. Uninstalling
+## 11. Uninstalling
 
 To remove just the CLI/tool itself — leaving your Obsidian vault and every
 synced note completely untouched — use the uninstall script. It works no
@@ -347,7 +395,7 @@ the project directory itself (source files, scripts, README) is a separate,
 manual step — the uninstaller only tears down the *installed* CLI and its
 automation.
 
-## 11. Security
+## 12. Security
 
 - **Read-only by construction.** `notion_client.py` implements only GET
   requests plus the two read-only POST endpoints (`/search`,
@@ -361,7 +409,7 @@ automation.
   header; log output never includes it.
 - **Least privilege.** Grant the Notion integration **Read content** only.
 
-## 12. Development
+## 13. Development
 
 ```bash
 python -m venv .venv

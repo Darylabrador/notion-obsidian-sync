@@ -9,6 +9,7 @@ from pathlib import Path
 
 import click
 
+from . import git_crypt
 from .config import Config, load_config
 from .logging_config import get_logger, setup_logging
 from .notion_client import NotionAPIError, NotionClient
@@ -310,6 +311,106 @@ def reset_state(yes: bool) -> None:
         if sidecar.exists():
             sidecar.unlink()
     click.echo("State database removed.")
+
+
+@main.command(name="git-crypt-setup")
+@click.option(
+    "--path",
+    "path_str",
+    default=None,
+    help="Directory to set up (default: the configured sync folder, "
+    "OBSIDIAN_VAULT_PATH/OBSIDIAN_SYNC_FOLDER).",
+)
+@click.option(
+    "--gpg-user",
+    "gpg_users",
+    multiple=True,
+    help="GPG key ID or email to grant decrypt access to. Repeatable "
+    "(--gpg-user a@x.com --gpg-user b@x.com).",
+)
+@click.option(
+    "--export-key",
+    "export_key_str",
+    default=None,
+    help="Also export a symmetric key file to this path — back it up somewhere "
+    "safe, outside the git history.",
+)
+def git_crypt_setup_cmd(
+    path_str: str | None, gpg_users: tuple[str, ...], export_key_str: str | None
+) -> None:
+    """Set up git-crypt so the synced notes folder can be committed to git
+    while staying encrypted at rest (useful before pushing it to any remote).
+
+    Initializes a git repository if needed, adds a `.gitattributes` that
+    encrypts every file, runs `git-crypt init`, and optionally grants GPG
+    collaborators and/or exports a symmetric key. Safe to re-run — already
+    completed steps are left as-is. Never commits anything on your behalf,
+    except `git-crypt add-gpg-user`'s own inherent commit of the wrapped key.
+    """
+    if path_str:
+        target = Path(path_str).expanduser().resolve()
+    else:
+        config = load_config()
+        problems = config.validate()
+        if problems:
+            click.echo(
+                "Configuration problems found (needed to determine the default --path):",
+                err=True,
+            )
+            for p in problems:
+                click.echo(f"  - {p}", err=True)
+            click.echo("Pass --path explicitly to set this up without a full .env.", err=True)
+            raise SystemExit(FAILURE)
+        target = config.sync_root
+        target.mkdir(parents=True, exist_ok=True)
+
+    export_key_path = Path(export_key_str).expanduser().resolve() if export_key_str else None
+
+    click.echo(f"Setting up git-crypt in {target}")
+    try:
+        result = git_crypt.setup(
+            target, gpg_users=list(gpg_users), export_key_path=export_key_path
+        )
+    except git_crypt.GitCryptError as exc:
+        click.echo(f"[FAIL] {exc}", err=True)
+        raise SystemExit(FAILURE) from exc
+
+    if result.created_git_repo:
+        click.echo(f"[OK] Initialized a git repository in {target}")
+    if result.wrote_gitattributes:
+        click.echo("[OK] Wrote .gitattributes (every file will be encrypted on commit)")
+    if result.already_initialized:
+        click.echo("[INFO] git-crypt was already initialized here — left as-is.")
+    if result.ran_git_crypt_init:
+        click.echo("[OK] Ran `git-crypt init` (generated a repository-specific encryption key)")
+    for user in result.added_gpg_users:
+        click.echo(f"[OK] Granted decrypt access to GPG user: {user}")
+    if result.exported_key_path:
+        click.echo(f"[OK] Exported symmetric key to {result.exported_key_path}")
+
+    click.echo("")
+    click.echo("Next steps:")
+    click.echo(f"  cd {target}")
+    click.echo("  git add .gitattributes")
+    click.echo("  git commit -m 'Enable git-crypt'")
+    if not result.added_gpg_users and not result.exported_key_path:
+        click.echo("")
+        click.echo(
+            "[WARN] No GPG user was added and no key was exported. Without one of these "
+            "you have no way to unlock this repository elsewhere, or recover it if the "
+            "local .git directory is ever lost. Re-run with --gpg-user <email> and/or "
+            "--export-key <path> to fix this now."
+        )
+    else:
+        click.echo(
+            "  Store the exported key (or make sure GPG users can decrypt) somewhere "
+            "safe, outside this git history."
+        )
+    click.echo(
+        "  Note: files stay readable in your local working copy while the repo is "
+        "unlocked (right after init/clone+unlock); they're only encrypted inside git "
+        "itself (history, and on push to a remote)."
+    )
 
 
 if __name__ == "__main__":
