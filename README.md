@@ -1,13 +1,35 @@
 # notion-obsidian-sync
 
 One-way, read-only synchronization from **Notion** into an **Obsidian** vault.
-Notion is always the source of truth. This tool never writes to Notion, and
-it only ever writes inside the Obsidian folder you configure.
 
-Runs locally on Linux or Windows, for free, with no third-party automation
-service (no Zapier/Make/n8n Cloud).
+Notion is always the source of truth. This tool never writes to Notion, and
+it only ever writes inside the Obsidian folder you configure. It runs
+entirely on your machine — no cloud service, no third-party automation
+platform (Zapier/Make/n8n Cloud), no data leaving your computer except calls
+to the official Notion API.
+
+## Highlights
+
+- **Read-only by construction** — no write/update/delete call to Notion
+  exists anywhere in the codebase (see [Security](#12-security)).
+- **Sandboxed writes** — everything this tool creates, edits, or deletes on
+  disk is confined to one configured subfolder of your vault.
+- **Incremental & idempotent** — only pages that actually changed are
+  re-downloaded; a second run with nothing changed touches zero files.
+- **Never clobbers your edits** — a locally-edited note is backed up to
+  `_Conflicts/` before Notion's version overwrites it; a note without our
+  frontmatter marker is never touched at all.
+- **Four sync modes** — a single page tree, one or more databases, a
+  property-filtered subset, or your entire accessible workspace.
+- **Free automation** — a systemd `--user` timer on Linux, Task Scheduler on
+  Windows. No paid service required.
+- **Optional at-rest encryption** — `git-crypt` integration if you want to
+  version-control (and optionally back up to a remote) the synced folder.
+
+## Table of contents
 
 - [How it works](#how-it-works)
+- [Choosing a sync mode](#choosing-a-sync-mode)
 - [1. Set up the Notion integration](#1-set-up-the-notion-integration)
 - [2. Install — Linux](#2-install--linux)
 - [3. Install — Windows](#3-install--windows)
@@ -37,6 +59,23 @@ service (no Zapier/Make/n8n Cloud).
 All writes are sandboxed to `OBSIDIAN_VAULT_PATH/OBSIDIAN_SYNC_FOLDER`. The
 tool never calls a Notion write endpoint (see [Security](#12-security)).
 
+## Choosing a sync mode
+
+The tool supports four ways to select what gets synced, controlled by which
+`.env` variables you set. They aren't mutually exclusive — combine them
+freely; results are deduplicated.
+
+| Mode | Set | What syncs | Good for |
+|---|---|---|---|
+| **A — Root page** | `NOTION_ROOT_PAGE_ID` | One page and every descendant page beneath it, mirrored as nested folders. | A single Notion "space" (e.g. a personal wiki page) with an arbitrary page hierarchy. |
+| **B — Databases** | `NOTION_DATABASE_IDS` | Rows from one or more databases, one folder per database. | Structured collections — a task tracker, a knowledge base, a CRM. |
+| **C — Filtered rows** | `NOTION_SYNC_PROPERTY` (with B or D) | Only the rows of a database whose named checkbox property is checked. | Publishing a curated subset of a larger database instead of everything in it. |
+| **D — Whole workspace** | `NOTION_SYNC_WORKSPACE=true` | Every page and database the integration currently has access to. | "Just sync everything I've shared with this integration" — no IDs to manage. |
+
+See [4. Configuration](#4-configuration) for the full variable reference and
+[7. How content is organized](#7-how-content-is-organized) for exactly how
+each mode lays out files on disk.
+
 ## 1. Set up the Notion integration
 
 1. Go to <https://app.notion.com/developers/connections> and click **New
@@ -63,7 +102,8 @@ tool never calls a Notion write endpoint (see [Security](#12-security)).
    - Alternatively, as a workspace owner, some workspaces let you connect
      the integration to the **entire workspace** from this same tab — the
      simplest option if you're using `NOTION_SYNC_WORKSPACE=true` (see
-     below) and don't want to hand-pick pages.
+     [Choosing a sync mode](#choosing-a-sync-mode)) and don't want to
+     hand-pick pages.
    - You can also grant access from inside a page itself: open it, click the
      `...` menu → **Connections** → add your integration — equivalent to
      adding it from the Content Access tab.
@@ -134,10 +174,10 @@ All configuration lives in `.env` (copy from `.env.example`). Never commit
 | `NOTION_TOKEN` | yes | Internal integration secret, read-only capability. |
 | `OBSIDIAN_VAULT_PATH` | yes | Absolute path to your Obsidian vault. Windows: `C:\Users\John\Documents\Obsidian\MyVault`. |
 | `OBSIDIAN_SYNC_FOLDER` | no (default `Notion`) | Subfolder inside the vault. **All writes/deletions are sandboxed to this folder.** |
-| `NOTION_ROOT_PAGE_ID` | one of these four | Mode A: sync this page and all descendant pages. |
-| `NOTION_DATABASE_IDS` | one of these four | Mode B: comma-separated database IDs to sync (rows become notes). |
-| `NOTION_SYNC_WORKSPACE` | one of these four (default `false`) | Mode D: sync every page/database the integration currently has access to — no ID needed. Can be combined with the two above (harmless overlap, everything is deduplicated). |
-| `NOTION_SYNC_PROPERTY` | no (default empty = sync everything) | Mode C: name of a checkbox property; only checked rows sync. Applies to `NOTION_DATABASE_IDS` and `NOTION_SYNC_WORKSPACE`. |
+| `NOTION_ROOT_PAGE_ID` | one of these four — [Mode A](#choosing-a-sync-mode) | Sync this page and all descendant pages. |
+| `NOTION_DATABASE_IDS` | one of these four — [Mode B](#choosing-a-sync-mode) | Comma-separated database IDs to sync (rows become notes). |
+| `NOTION_SYNC_WORKSPACE` | one of these four (default `false`) — [Mode D](#choosing-a-sync-mode) | Sync every page/database the integration currently has access to — no ID needed. Can be combined with the two above (harmless overlap, everything is deduplicated). |
+| `NOTION_SYNC_PROPERTY` | no (default empty = sync everything) — [Mode C](#choosing-a-sync-mode) | Name of a checkbox property; only checked rows sync. Applies to `NOTION_DATABASE_IDS` and `NOTION_SYNC_WORKSPACE`. |
 | `ORPHAN_POLICY` | no (default `keep`) | `keep` \| `archive` \| `delete`. What to do with a note whose Notion page disappeared. |
 | `DOWNLOAD_ASSETS` | no (default `true`) | Download images/files referenced in pages. |
 | `CONVERT_NOTION_LINKS` | no (default `true`) | Rewrite links between synced Notion pages as `[[wikilinks]]`. |
@@ -145,22 +185,32 @@ All configuration lives in `.env` (copy from `.env.example`). Never commit
 | `LOG_LEVEL` | no (default `INFO`) | Python logging level. |
 | `NOTION_API_VERSION` | no | Advanced: override the `Notion-Version` header (default `2025-09-03`). |
 
-You can combine `NOTION_ROOT_PAGE_ID` and `NOTION_DATABASE_IDS` — both are
-synced in the same run.
+At least one of `NOTION_ROOT_PAGE_ID`, `NOTION_DATABASE_IDS`, or
+`NOTION_SYNC_WORKSPACE=true` must be set — `doctor` and `sync` will refuse
+to run otherwise.
 
 ## 5. Usage
 
 ```bash
-notion-obsidian-sync sync              # incremental sync
-notion-obsidian-sync sync --full       # re-verify every page's content, even unchanged ones
-notion-obsidian-sync sync --page ID    # sync a single page by ID (no orphan handling)
-notion-obsidian-sync sync --verbose    # debug logging
-notion-obsidian-sync dry-run           # show what would change; writes nothing
-notion-obsidian-sync status            # summarize local state
-notion-obsidian-sync doctor            # check Python, .env, Notion access, vault permissions
-notion-obsidian-sync reset-state       # forget local sync state (does not delete notes)
-notion-obsidian-sync git-crypt-setup   # encrypt the sync folder at rest with git-crypt (optional)
+notion-obsidian-sync sync                    # incremental sync
+notion-obsidian-sync sync --full             # re-verify every page's content, even unchanged ones
+notion-obsidian-sync sync --page ID          # sync a single page by ID (no orphan handling)
+notion-obsidian-sync sync --dry-run          # combinable with any flag above — computes actions, writes nothing
+notion-obsidian-sync sync --verbose          # debug logging
+notion-obsidian-sync dry-run                 # shorthand for `sync --dry-run`
+notion-obsidian-sync status                  # summarize local state
+notion-obsidian-sync doctor                  # check Python, .env, Notion access, vault permissions
+notion-obsidian-sync reset-state             # forget local sync state (does not delete notes)
+notion-obsidian-sync reset-state --yes       # same, without the confirmation prompt
+notion-obsidian-sync git-crypt-setup         # encrypt the sync folder at rest with git-crypt (optional)
+notion-obsidian-sync --version               # print the installed version
+notion-obsidian-sync <command> --help        # full option reference for any command
 ```
+
+While a sync is running in a terminal, a live progress bar tracks the two
+phases (`Resolving pages`, then `Syncing`) with an ETA; it's automatically
+disabled when output is redirected to a file/log, or when `--verbose` is
+used (debug log lines would otherwise interleave with it).
 
 Exit code is `0` if every page synced without error, `1` otherwise — a single
 failing page never stops the rest of the run (see `sync` log output for
